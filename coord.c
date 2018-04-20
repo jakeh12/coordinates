@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <math.h>
+#include <signal.h>
 
 #include <string.h>
 #include <fcntl.h>
@@ -16,12 +17,14 @@
 #define deg_to_rad(deg) (deg * M_PI / 180.0)
 #define rad_to_deg(rad) (rad * 180.0 / M_PI)
 
+static volatile int running = 1;
 
 struct coord
 {
 	double lat;
 	double lon;
 	double timestamp;
+	int valid;
 };
 
 
@@ -30,10 +33,11 @@ struct gps_worker_struct
 	int gps_fd;
 	struct coord current;
 	struct coord previous;
+	struct coord oldest;
 	pthread_mutex_t lock;
 };
 
-
+void keyboard_interrupt_handler(int sig_num);
 void* gps_worker(void *args);
 struct coord gps_get_instant(struct gps_worker_struct* gps_args);
 int gps_init(char* serial_path);
@@ -45,13 +49,51 @@ double coord_distance(struct coord origin, struct coord destination);
 struct coord coord_dist_radial(struct coord origin, double distance, double radial);
 double coord_course(struct coord origin, struct coord destination);
 void coord_print(struct coord coord);
+void log_coord_string(struct coord coord, char* buffer);
 
 
-int main(void)
+int main(int argc, const char * argv[])
 {
+	/* catch keyboard interrupt signal (ctrl+c) and handle it */
+    signal(SIGINT, keyboard_interrupt_handler);
 	
+	/* check if enough arguments are provided */
+	if (argc < 2)
+	{
+		fprintf(stderr, "missing arguments\n");
+	    printf("usage: coord serial_port [update_rate] [log_file]\n");
+	    exit(EXIT_FAILURE);
+	}
+	
+	/* get serial port device path */
+	char serial_path[120];
+	strcpy(serial_path, argv[1]);
+	
+	/* get update rate */
+	int update_rate = 1;
+	if (argc > 2)
+	{
+		update_rate = atoi(argv[2]);
+		if (update_rate < 1 || update_rate > 1000000)
+		{
+			fprintf(stderr, "update rate needs to be between 1 and 1000000\n");
+		    exit(EXIT_FAILURE);
+		}
+	}
+	
+	/* get log file path */
+	FILE *log_file = NULL;
+	if (argc > 3)
+	{
+		char log_path[120];
+		strcpy(log_path, argv[3]);
+		
+		/* open log file for writing */
+		log_file = fopen(log_path, "w");
+	}
+		
 	/* initialize gps */
-	int gps_fd = gps_init("/dev/tty.usbmodem1411");
+	int gps_fd = gps_init(serial_path);
 	
 	/* intialize gps polling thread */
 	struct gps_worker_struct gps_args;
@@ -63,26 +105,48 @@ int main(void)
 	/* create coordinate to hold current position */
 	struct coord current;
 	
+	/* buffer for logging coordinates */
+	char log_string_buffer[64];
+	
 	/* infinite while loop to calculate instantaneous coordinates at a set rate */
-	while(1)
+	while(running)
 	{
 
-		/* calculate instantaneous position */
-        pthread_mutex_lock(&gps_args.lock);
+		/* get instantaneous position */
+		pthread_mutex_lock(&gps_args.lock);
 		current = gps_get_instant(&gps_args);
-        pthread_mutex_unlock(&gps_args.lock);
+		pthread_mutex_unlock(&gps_args.lock);
 		
 		/* print the coordinate */
 		coord_print(current);
-	
-		/* wait 10 ms (results in 100 hz update rate) */
-		usleep(10000);
+		
+		/* output to file if log file is open */
+		if (log_file != NULL)
+		{
+			log_coord_string(current, log_string_buffer);
+			fprintf(log_file, "%s", log_string_buffer);
+		}
+		
+		/* wait for a period defined by the update rate */
+		usleep((int)((1.0 / update_rate) * 1000000.0));
 	}
+	
+	/* stopping message */
+	printf("\nstopping...\n");
 	
 	/* close gps */
 	gps_close(gps_fd);
 	
+	/* close log file */
+	fclose(log_file);
+	
 	return EXIT_SUCCESS;
+}
+
+
+void keyboard_interrupt_handler(int sig_num)
+{
+    running = 0;
 }
 
 
@@ -94,20 +158,31 @@ void* gps_worker(void *args)
 	/* create buffer for gps messages */
 	char buffer[82];
 	
+	/* buffer for coordinate read */
+	struct coord message_coord;
+	
 	/* infinite while loop for polling gps messages */
 	while(1)
 	{
 		/* read gps message */
 		gps_readline(gps_args->gps_fd, buffer);
-	
+		
 		/* check if message is gll */
 		if (gps_is_gll(buffer))
 		{
-			/* parse gll message and update current and previous coordinates */
-	        pthread_mutex_lock(&gps_args->lock);
-			gps_args->previous = gps_args->current;
-			gps_args->current = gps_parse_gll(buffer);
-	        pthread_mutex_unlock(&gps_args->lock);
+			/* parse gll message into a coordinate */
+			message_coord = gps_parse_gll(buffer);
+			
+			/* check if coordinate is valid */
+			if (message_coord.valid == 1)
+			{
+				/* update coordinate history */
+				pthread_mutex_lock(&gps_args->lock);
+				gps_args->oldest = gps_args->previous;
+				gps_args->previous = gps_args->current;
+				gps_args->current = message_coord;
+				pthread_mutex_unlock(&gps_args->lock);
+			}
 		}
 	}
 	
@@ -120,33 +195,41 @@ struct coord gps_get_instant(struct gps_worker_struct* gps_args)
 	/* create coordinate to hold the result */
 	struct coord instant;
 	
-	/* create timeval struct to retrieve current time */
+	/* create timeval struct to retrieve absolute time */
 	struct timeval tv;
 	gettimeofday(&tv, NULL);
 	
-	/* calculate current time in seconds */
-	double time_current = tv.tv_sec + tv.tv_usec / 1000000.0;
+	/* calculate real time into seconds */
+	double time_real = tv.tv_sec + tv.tv_usec / 1000000.0;
 	
-	/* calculate latest known course */
-	double course_old = coord_course(gps_args->previous, gps_args->current);
+	/* calculate time passed since last known gps coordinate was obtained */
+	double time_new = time_real - gps_args->current.timestamp;
 	
-	/* calculate latest known distance travelled */
-	double distance_old = coord_distance(gps_args->previous, gps_args->current);
+	/* calculate courses between the last three known points */
+	double course_current = coord_course(gps_args->previous, gps_args->current);
+	double course_previous = coord_course(gps_args->oldest, gps_args->previous);
 	
-	/* calculate latest known speed */
-	double speed_old = distance_old / (gps_args->current.timestamp - gps_args->previous.timestamp);
+	/* calculate turn rate based on the last two known courses */
+	double turn_rate = (course_current - course_previous) / (gps_args->current.timestamp - gps_args->previous.timestamp);
 	
-	/* calculate time passed since last known gps coordinate */
-	double time_new = time_current - gps_args->current.timestamp;
+	/* calculate distances between the last three known points */
+	double distance_current = coord_distance(gps_args->previous, gps_args->current);
+	/* double distance_previous = coord_distance(gps_args->oldest, gps_args->previous); */ /* use for averaging */
 	
-	/* calculate distance passed since last known gps coordinate */
-	double distance_new = time_new * speed_old;
+	/* calculate speeds between the last three known points */
+	double speed_current = distance_current / (gps_args->current.timestamp - gps_args->previous.timestamp);
+	/* double speed_previous = distance_old / (gps_args->previous.timestamp - gps_args->oldest.timestamp); */ /* use for averaging */
 	
-	/* calculate new coordinate based on original coordinate, distance traveled since, and course since */
-	instant = coord_dist_radial(gps_args->current, distance_new, course_old);
+	/* calculate distance change and course change since last known gps coordinate */
+	double distance_new = time_new * speed_current;
+	/* double distance_new = time_new * ((speed_current + speed_previous) / 2); */ /* use for averaging */
+	double course_new = turn_rate * time_new;
+	
+	/* calculate new coordinate based on original coordinate, new distance change since, and course change since */
+	instant = coord_dist_radial(gps_args->current, distance_new, course_new);
 	
 	/* update time stamp of the result to current time */
-	instant.timestamp = time_current;
+	instant.timestamp = time_new;
 	
 	/* return result */
 	return instant;
@@ -260,6 +343,14 @@ struct coord gps_parse_gll(char* gll_string)
 	int unix_epoch_midnight = (tv.tv_sec / 86400) * 86400;
 	parsed.timestamp = timestamp + unix_epoch_midnight;
 	
+	/* pass validity flag */
+	strncpy(buffer, gll_string+45, 1);
+	buffer[1] = '\0';
+	if (buffer[0] == 'A')
+		parsed.valid = 1;
+	else
+		parsed.valid = 0;
+	
 	/* return result */
 	return parsed;
 }
@@ -338,4 +429,10 @@ double coord_course(struct coord origin, struct coord destination)
 void coord_print(struct coord coord)
 {
 	printf("%.2f: %f, %f\n", coord.timestamp, coord.lat, coord.lon);
+}
+
+
+void log_coord_string(struct coord coord, char* buffer)
+{
+	sprintf(buffer, "%.10f,%.10f,%.10f\n", coord.timestamp, coord.lat, coord.lon);
 }
