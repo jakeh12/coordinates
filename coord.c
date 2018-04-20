@@ -11,6 +11,8 @@
 #include <sys/ioctl.h>
 #include <sys/time.h>
 
+#include <pthread.h>
+
 #define deg_to_rad(deg) (deg * M_PI / 180.0)
 #define rad_to_deg(rad) (rad * 180.0 / M_PI)
 
@@ -21,6 +23,134 @@ struct coord
 	double lon;
 	double timestamp;
 };
+
+
+struct gps_worker_struct
+{
+	int gps_fd;
+	struct coord current;
+	struct coord previous;
+	pthread_mutex_t lock;
+};
+
+
+void* gps_worker(void *args);
+struct coord gps_get_instant(struct gps_worker_struct* gps_args);
+int gps_init(char* serial_path);
+void gps_close(int fd);
+void gps_readline(int fd, char* buffer);
+int gps_is_gll(char* buffer);
+struct coord gps_parse_gll(char* gll_string);
+double coord_distance(struct coord origin, struct coord destination);
+struct coord coord_dist_radial(struct coord origin, double distance, double radial);
+double coord_course(struct coord origin, struct coord destination);
+void coord_print(struct coord coord);
+
+
+int main(void)
+{
+	
+	/* initialize gps */
+	int gps_fd = gps_init("/dev/tty.usbmodem1411");
+	
+	/* intialize gps polling thread */
+	struct gps_worker_struct gps_args;
+	gps_args.gps_fd = gps_fd;
+	pthread_mutex_lock(&gps_args.lock); 
+	pthread_t gps_thread;
+	pthread_create(&gps_thread, NULL, gps_worker, (void*)&gps_args);
+
+	/* create coordinate to hold current position */
+	struct coord current;
+	
+	/* infinite while loop to calculate instantaneous coordinates at a set rate */
+	while(1)
+	{
+
+		/* calculate instantaneous position */
+        pthread_mutex_lock(&gps_args.lock);
+		current = gps_get_instant(&gps_args);
+        pthread_mutex_unlock(&gps_args.lock);
+		
+		/* print the coordinate */
+		coord_print(current);
+	
+		/* wait 10 ms (results in 100 hz update rate) */
+		usleep(10000);
+	}
+	
+	/* close gps */
+	gps_close(gps_fd);
+	
+	return EXIT_SUCCESS;
+}
+
+
+void* gps_worker(void *args)
+{
+	/* get arguments from parameter pointer */
+	struct gps_worker_struct* gps_args = (struct gps_worker_struct*) args;
+	
+	/* create buffer for gps messages */
+	char buffer[82];
+	
+	/* infinite while loop for polling gps messages */
+	while(1)
+	{
+		/* read gps message */
+		gps_readline(gps_args->gps_fd, buffer);
+	
+		/* check if message is gll */
+		if (gps_is_gll(buffer))
+		{
+			/* parse gll message and update current and previous coordinates */
+	        pthread_mutex_lock(&gps_args->lock);
+			gps_args->previous = gps_args->current;
+			gps_args->current = gps_parse_gll(buffer);
+	        pthread_mutex_unlock(&gps_args->lock);
+		}
+	}
+	
+	pthread_exit(NULL);
+}
+
+
+struct coord gps_get_instant(struct gps_worker_struct* gps_args)
+{
+	/* create coordinate to hold the result */
+	struct coord instant;
+	
+	/* create timeval struct to retrieve current time */
+	struct timeval tv;
+	gettimeofday(&tv, NULL);
+	
+	/* calculate current time in seconds */
+	double time_current = tv.tv_sec + tv.tv_usec / 1000000.0;
+	
+	/* calculate latest known course */
+	double course_old = coord_course(gps_args->previous, gps_args->current);
+	
+	/* calculate latest known distance travelled */
+	double distance_old = coord_distance(gps_args->previous, gps_args->current);
+	
+	/* calculate latest known speed */
+	double speed_old = distance_old / (gps_args->current.timestamp - gps_args->previous.timestamp);
+	
+	/* calculate time passed since last known gps coordinate */
+	double time_new = time_current - gps_args->current.timestamp;
+	
+	/* calculate distance passed since last known gps coordinate */
+	double distance_new = time_new * speed_old;
+	
+	/* calculate new coordinate based on original coordinate, distance traveled since, and course since */
+	instant = coord_dist_radial(gps_args->current, distance_new, course_old);
+	
+	/* update time stamp of the result to current time */
+	instant.timestamp = time_current;
+	
+	/* return result */
+	return instant;
+}
 
 
 int gps_init(char* serial_path)
@@ -208,50 +338,4 @@ double coord_course(struct coord origin, struct coord destination)
 void coord_print(struct coord coord)
 {
 	printf("%.2f: %f, %f\n", coord.timestamp, coord.lat, coord.lon);
-}
-
-
-int main(void)
-{
-	/* create struct for origin coordinate */
-	struct coord origin;
-	
-	/* create buffer for gps messages */
-	char buffer[82];
-
-	/* initialize gps */
-	int gps_fd = gps_init("/dev/tty.usbmodem1411");
-	
-	while(1)
-	{
-		/* read a message from gps */	
-		gps_readline(gps_fd, buffer);
-		
-		/* check if message is gll */
-		if (gps_is_gll(buffer))
-		{
-			/* parse gll message */
-			origin = gps_parse_gll(buffer);
-		}
-		
-		/* set distance and radial from the origin coordinate */
-		double distance = 100.0;
-		double radial = 90.0;
-	
-		/* calculate target coordinate */
-		struct coord result = coord_dist_radial(origin, distance, radial);
-	
-		/* print coordinates */
-		coord_print(origin);
-		coord_print(result);
-	
-		/* calculate distance and course */
-		printf("distance: %f\n", coord_distance(origin, result));
-		printf("course: %f\n\n", coord_course(origin, result));
-	}
-	
-	/* close gps */
-	gps_close(gps_fd);
-	
-	return EXIT_SUCCESS;
 }
