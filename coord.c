@@ -31,6 +31,7 @@ struct coord
 struct gps_worker_struct
 {
 	int gps_fd;
+	double time_offset;
 	struct coord current;
 	struct coord previous;
 	struct coord oldest;
@@ -131,6 +132,8 @@ int main(int argc, const char * argv[])
 		usleep((int)((1.0 / update_rate) * 1000000.0));
 	}
 	
+	pthread_join(gps_thread, NULL);
+	
 	/* stopping message */
 	printf("\nstopping...\n");
 	
@@ -161,8 +164,12 @@ void* gps_worker(void *args)
 	/* buffer for coordinate read */
 	struct coord message_coord;
 	
+	int sync_time = 1;
+	
+	int valid_counter = 0;
+	
 	/* infinite while loop for polling gps messages */
-	while(1)
+	while(running)
 	{
 		/* read gps message */
 		gps_readline(gps_args->gps_fd, buffer);
@@ -176,12 +183,27 @@ void* gps_worker(void *args)
 			/* check if coordinate is valid */
 			if (message_coord.valid == 1)
 			{
+				/* sync time if second coordinate is received */
+				if (sync_time && valid_counter == 1)
+				{
+					/* get system real time */
+					struct timeval tv;
+					gettimeofday(&tv, NULL);
+					double time_real = tv.tv_sec + tv.tv_usec / 1000000.0;
+					
+					/* calculate time offset between real and gps time */
+					gps_args->time_offset = time_real - message_coord.timestamp;
+					
+					/* do not sync time again */
+					sync_time = 0;
+				}
 				/* update coordinate history */
 				pthread_mutex_lock(&gps_args->lock);
 				gps_args->oldest = gps_args->previous;
 				gps_args->previous = gps_args->current;
 				gps_args->current = message_coord;
 				pthread_mutex_unlock(&gps_args->lock);
+				valid_counter++;
 			}
 		}
 	}
@@ -199,11 +221,12 @@ struct coord gps_get_instant(struct gps_worker_struct* gps_args)
 	struct timeval tv;
 	gettimeofday(&tv, NULL);
 	
-	/* calculate real time into seconds */
-	double time_real = tv.tv_sec + tv.tv_usec / 1000000.0;
+	/* calculate real time into seconds and add the skew from gps */
+	double time_real = gps_args->time_offset + tv.tv_sec + tv.tv_usec / 1000000.0;
 	
 	/* calculate time passed since last known gps coordinate was obtained */
 	double time_new = time_real - gps_args->current.timestamp;
+	printf("time passed: %f\n", time_new);
 	
 	/* calculate courses between the last three known points */
 	double course_current = coord_course(gps_args->previous, gps_args->current);
@@ -229,7 +252,7 @@ struct coord gps_get_instant(struct gps_worker_struct* gps_args)
 	instant = coord_dist_radial(gps_args->current, distance_new, course_new);
 	
 	/* update time stamp of the result to current time */
-	instant.timestamp = time_new;
+	instant.timestamp = time_real;
 	
 	/* return result */
 	return instant;
@@ -344,8 +367,8 @@ struct coord gps_parse_gll(char* gll_string)
 	parsed.timestamp = timestamp + unix_epoch_midnight;
 	
 	/* pass validity flag */
-	strncpy(buffer, gll_string+45, 1);
-	buffer[1] = '\0';
+	strncpy(buffer, gll_string+44, 1);
+	buffer[1] = '\0';	
 	if (buffer[0] == 'A')
 		parsed.valid = 1;
 	else
