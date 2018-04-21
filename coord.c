@@ -51,13 +51,14 @@ struct coord coord_dist_radial(struct coord origin, double distance, double radi
 double coord_course(struct coord origin, struct coord destination);
 void coord_print(struct coord coord);
 void log_coord_string(struct coord coord, char* buffer);
+void log_coord_string_kml(struct coord coord, char* buffer);
 
 
 int main(int argc, const char * argv[])
-{
+{	
 	/* catch keyboard interrupt signal (ctrl+c) and handle it */
     signal(SIGINT, keyboard_interrupt_handler);
-	
+
 	/* check if enough arguments are provided */
 	if (argc < 2)
 	{
@@ -65,11 +66,11 @@ int main(int argc, const char * argv[])
 	    printf("usage: coord serial_port [update_rate] [log_file]\n");
 	    exit(EXIT_FAILURE);
 	}
-	
+
 	/* get serial port device path */
 	char serial_path[120];
 	strcpy(serial_path, argv[1]);
-	
+
 	/* get update rate */
 	int update_rate = 1;
 	if (argc > 2)
@@ -81,34 +82,54 @@ int main(int argc, const char * argv[])
 		    exit(EXIT_FAILURE);
 		}
 	}
-	
+
 	/* get log file path */
+	FILE *log_file_kml = NULL;
 	FILE *log_file = NULL;
 	if (argc > 3)
 	{
 		char log_path[120];
 		strcpy(log_path, argv[3]);
-		
+
 		/* open log file for writing */
 		log_file = fopen(log_path, "w");
-	}
+
+
+		///////
+	    strcat(log_path, "_.kml");
+		log_file_kml = fopen(log_path, "w");
 		
+		fprintf(log_file_kml, "%s",	"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+									"<kml xmlns=\"http://earth.google.com/kml/2.1\">\n"
+									"<Document>\n"
+									"<Placemark>\n"
+									"<name>Path A</name>\n"
+									"<LineString>\n"
+									"<tessellate>1</tessellate>\n"
+									"<coordinates>\n");
+
+		///////
+	}
+
 	/* initialize gps */
 	int gps_fd = gps_init(serial_path);
-	
+
 	/* intialize gps polling thread */
 	struct gps_worker_struct gps_args;
+	gps_args.current.valid = 0;
+	gps_args.previous.valid = 0;
+	gps_args.oldest.valid = 0;
 	gps_args.gps_fd = gps_fd;
-	pthread_mutex_lock(&gps_args.lock); 
+	pthread_mutex_lock(&gps_args.lock);
 	pthread_t gps_thread;
 	pthread_create(&gps_thread, NULL, gps_worker, (void*)&gps_args);
 
 	/* create coordinate to hold current position */
 	struct coord current;
-	
+
 	/* buffer for logging coordinates */
 	char log_string_buffer[64];
-	
+
 	/* infinite while loop to calculate instantaneous coordinates at a set rate */
 	while(running)
 	{
@@ -117,32 +138,51 @@ int main(int argc, const char * argv[])
 		pthread_mutex_lock(&gps_args.lock);
 		current = gps_get_instant(&gps_args);
 		pthread_mutex_unlock(&gps_args.lock);
-		
+
 		/* print the coordinate */
 		coord_print(current);
-		
+
 		/* output to file if log file is open */
-		if (log_file != NULL)
+		if (log_file != NULL && current.valid > 0)
 		{
 			log_coord_string(current, log_string_buffer);
-			fprintf(log_file, "%s", log_string_buffer);
+			fprintf(log_file, "%s\n", log_string_buffer);
+			log_coord_string_kml(current, log_string_buffer);
+			fprintf(log_file_kml, "%s\n", log_string_buffer);
+
+
 		}
-		
+
 		/* wait for a period defined by the update rate */
 		usleep((int)((1.0 / update_rate) * 1000000.0));
 	}
-	
+
 	pthread_join(gps_thread, NULL);
-	
+
 	/* stopping message */
 	printf("\nstopping...\n");
-	
+
 	/* close gps */
 	gps_close(gps_fd);
-	
+
 	/* close log file */
 	fclose(log_file);
-	
+
+
+	fprintf(log_file_kml, "%s",	"</coordinates>\n"
+								"</LineString>\n"
+								"<Style>\n"
+								"<LineStyle>\n"
+								"<color>#ff0000ff</color>\n"
+								"<width>1</width>\n"
+								"</LineStyle>\n"
+								"</Style>\n"
+								"</Placemark>\n"
+								"</Document>\n"
+								"</kml>\n");
+
+	fclose(log_file_kml);
+
 	return EXIT_SUCCESS;
 }
 
@@ -165,8 +205,13 @@ void* gps_worker(void *args)
 	struct coord message_coord;
 	
 	int sync_time = 1;
-	
 	int valid_counter = 0;
+	
+	//////////////////////////////////////////
+	char raw_log_buffer[64];
+	
+	FILE *raw_log = fopen("raw_log.txt", "a+");
+	//////////////////////////////////////////
 	
 	/* infinite while loop for polling gps messages */
 	while(running)
@@ -183,6 +228,12 @@ void* gps_worker(void *args)
 			/* check if coordinate is valid */
 			if (message_coord.valid == 1)
 			{
+				//////////////////////////////////////////
+				/* log coordinate into file */
+				log_coord_string(message_coord, raw_log_buffer);
+				fprintf(raw_log, "%s\n", raw_log_buffer);
+				//////////////////////////////////////////
+				
 				/* sync time if second coordinate is received */
 				if (sync_time && valid_counter == 1)
 				{
@@ -207,6 +258,9 @@ void* gps_worker(void *args)
 			}
 		}
 	}
+	//////////////////////////////////////////
+	fclose(raw_log);
+	//////////////////////////////////////////
 	
 	pthread_exit(NULL);
 }
@@ -226,6 +280,9 @@ struct coord gps_get_instant(struct gps_worker_struct* gps_args)
 	
 	/* calculate time passed since last known gps coordinate was obtained */
 	double time_new = time_real - gps_args->current.timestamp;
+	
+	if (time_new < 0.0)
+		time_new = 0.000001;
 	printf("time passed: %f\n", time_new);
 	
 	/* calculate courses between the last three known points */
@@ -246,13 +303,17 @@ struct coord gps_get_instant(struct gps_worker_struct* gps_args)
 	/* calculate distance change and course change since last known gps coordinate */
 	double distance_new = time_new * speed_current;
 	/* double distance_new = time_new * ((speed_current + speed_previous) / 2); */ /* use for averaging */
-	double course_new = turn_rate * time_new;
+	double course_new = turn_rate * time_new + course_current;
 	
 	/* calculate new coordinate based on original coordinate, new distance change since, and course change since */
-	instant = coord_dist_radial(gps_args->current, distance_new, course_new);
+	instant = coord_dist_radial(gps_args->current, distance_new, course_current); /* <<<<<< change to course_current to avoid course prediction */
 	
 	/* update time stamp of the result to current time */
 	instant.timestamp = time_real;
+	
+	instant.valid = 0;
+	if (gps_args->current.valid > 0 && gps_args->previous.valid > 0 && gps_args->oldest.valid > 0)
+		instant.valid = 2;
 	
 	/* return result */
 	return instant;
@@ -381,11 +442,11 @@ struct coord gps_parse_gll(char* gll_string)
 
 double coord_distance(struct coord origin, struct coord destination)
 {
-	/* convert coordinates to radians and change east longitude positive by formula sign convention */
+	/* convert coordinates to radians */
 	origin.lat=deg_to_rad(origin.lat);
-	origin.lon=-deg_to_rad(origin.lon);
+	origin.lon=deg_to_rad(origin.lon);
 	destination.lat=deg_to_rad(destination.lat);
-	destination.lon=-deg_to_rad(destination.lon);
+	destination.lon=deg_to_rad(destination.lon);
 	
 	/* formula from http://www.edwilliams.org/avform.htm#Dist */
 	double distance = 2*asin(sqrt(pow(sin((origin.lat-destination.lat)/2.0),2.0)+cos(origin.lat)*cos(destination.lat)*pow(sin((origin.lon-destination.lon)/2.0),2.0)));
@@ -400,9 +461,9 @@ double coord_distance(struct coord origin, struct coord destination)
 
 struct coord coord_dist_radial(struct coord origin, double distance, double radial)
 {
-	/* convert parameters to radians and change west longitude positive by formula sign convention */
+	/* convert parameters to radians */
 	origin.lat = deg_to_rad(origin.lat);
-	origin.lon = -deg_to_rad(origin.lon);
+	origin.lon = deg_to_rad(origin.lon);
 		
 	/* invert radial to use positive clockwise angle and convert to radians */ 
 	radial = deg_to_rad(-radial);
@@ -417,9 +478,9 @@ struct coord coord_dist_radial(struct coord origin, double distance, double radi
 	result.lat = asin(sin(origin.lat)*cos(distance)+cos(origin.lat)*sin(distance)*cos(radial));
 	result.lon = fmod(origin.lon-atan2(sin(radial)*sin(distance)*cos(origin.lat),cos(distance)-sin(origin.lat)*sin(result.lat))+M_PI,2.0*M_PI)-M_PI;
   
-	/* convert result coordinate to degrees and switch to west longitude negative */
+	/* convert result coordinate to degrees */
 	result.lat = rad_to_deg(result.lat);
-	result.lon = -rad_to_deg(result.lon);
+	result.lon = rad_to_deg(result.lon);
   
 	/* return result pointer */
 	return result;
@@ -428,11 +489,11 @@ struct coord coord_dist_radial(struct coord origin, double distance, double radi
 
 double coord_course(struct coord origin, struct coord destination)
 {
-	/* convert coordinates to radians and east longitude positive by formula sign convention */
+	/* convert coordinates to radians */
 	origin.lat=deg_to_rad(origin.lat);
-	origin.lon=-deg_to_rad(origin.lon);
+	origin.lon=deg_to_rad(origin.lon);
 	destination.lat=deg_to_rad(destination.lat);
-	destination.lon=-deg_to_rad(destination.lon);
+	destination.lon=deg_to_rad(destination.lon);
 	
 	/* formula from http://www.edwilliams.org/avform.htm#Crs */
 	double course = fmod(atan2(sin(origin.lon-destination.lon)*cos(destination.lat),cos(origin.lat)*sin(destination.lat)-sin(origin.lat)*cos(destination.lat)*cos(origin.lon-destination.lon)),2*M_PI);
@@ -457,5 +518,11 @@ void coord_print(struct coord coord)
 
 void log_coord_string(struct coord coord, char* buffer)
 {
-	sprintf(buffer, "%.10f,%.10f,%.10f\n", coord.timestamp, coord.lat, coord.lon);
+	sprintf(buffer, "%.10f,%.10f,%.10f", coord.timestamp, coord.lat, coord.lon);
+}
+
+
+void log_coord_string_kml(struct coord coord, char* buffer)
+{
+	sprintf(buffer, "%.10f,%.10f,%.10f", coord.lon, coord.lat, 0.0);
 }
